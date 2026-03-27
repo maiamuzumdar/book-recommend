@@ -356,25 +356,33 @@ Sizes: `S` (small), `M` (medium), `L` (large). Cover IDs come from the `covers` 
 | **Frontend** | Plain HTML / CSS / JavaScript | Simple, no build tools, focus on the recommendation logic |
 | **Metadata source** | Open Library API | Free, no auth, good coverage via ISBN lookup |
 | **Collaborative filtering** | Surprise library (optional, future) | Purpose-built for rating-based recommender systems |
+| **Testing** | pytest, requests-mock, pytest-cov | Modern Python testing standard; see Testing section below |
 
 ### Project Structure (Planned)
 
 ```
 book-recommend/
 ├── project-plan.md          # This document
-├── data.csv                 # Goodreads export (or symlink)
+├── pytest.ini               # Pytest configuration
 ├── backend/
+│   ├── __init__.py          # Package marker for imports
 │   ├── app.py               # API server
 │   ├── recommender.py       # Core recommendation engine
 │   ├── data_loader.py       # Load and clean Goodreads data
 │   ├── metadata_fetcher.py  # Open Library API integration
 │   └── requirements.txt     # Python dependencies
+├── tests/
+│   ├── __init__.py          # Package marker for imports
+│   ├── conftest.py          # Shared test fixtures
+│   ├── test_data_loader.py  # DataLoader unit tests
+│   └── test_metadata_fetcher.py  # MetadataFetcher unit tests
 ├── frontend/
 │   ├── index.html           # Main page
 │   ├── style.css            # Styling
 │   └── app.js               # Frontend logic, API calls
 └── data/
-    └── enriched_books.json   # Cached enriched book metadata
+    ├── data.csv              # Goodreads export
+    └── enriched_books.json   # Cached enriched book metadata (gitignored)
 ```
 
 ---
@@ -428,10 +436,107 @@ book-recommend/
 | 2026-03-26 | Start with content-based + popularity hybrid | Collaborative filtering needs more users; content-based works well for single-user scenario |
 | 2026-03-26 | v1 scope: rank the to-read shelf only (Tier 1) | Fetch metadata for existing 214 books; expanding to discover new books is a Tier 2 enhancement |
 | 2026-03-26 | Cache enriched data as JSON file (`data/enriched_books.json`) | Simple, human-readable, adequate for ~200–1000 books; can migrate to SQLite if project grows |
+| 2026-03-26 | Testing: pytest + requests-mock + pytest-cov | Modern standard, clean fixture system, native HTTP mocking for requests library |
+| 2026-03-26 | Test data: in-memory fixtures, not external files | Fast, self-contained, no file pollution; temp dirs for file-based tests |
 
 ---
 
-## Verification & Testing
+## Testing
+
+### Framework Choices & Rationale
+
+| Tool | Role | Why we chose it |
+|------|------|----------------|
+| **pytest** | Test framework | Modern Python standard (~52% adoption). Uses plain `assert` instead of unittest's verbose `self.assertEqual`. Powerful fixture system with dependency injection and scoping. Automatic test discovery. Rich plugin ecosystem. |
+| **requests-mock** | HTTP mocking | Integrates natively with pytest as a fixture parameter — no decorators or context managers needed. Cleaner than `unittest.mock` for mocking `requests.Session` calls. Purpose-built for the `requests` library we use. |
+| **pytest-cov** | Coverage reporting | Tracks which lines of backend code are exercised by tests. Integrates directly with pytest via `--cov` flag. |
+| **pandas.testing** | DataFrame assertions | Built-in pandas module with `assert_frame_equal` and `assert_series_equal` for comparing DataFrames in tests. |
+
+**Why not unittest?** unittest requires subclassing `TestCase`, using special assertion methods (`assertEqual`, `assertTrue`), and verbose `setUp`/`tearDown`. pytest achieves the same with less boilerplate and better error messages.
+
+**Why not VCR.py for HTTP mocking?** VCR.py records real API responses to "cassette" files and replays them. Good for integration tests, but adds file management overhead. For unit tests, requests-mock is simpler — we define expected responses inline and don't need to manage cassette files.
+
+### How to Run Tests
+
+```bash
+# From the book-recommend/ directory:
+pytest -v                    # Run all tests with verbose output
+pytest -v --cov=backend      # Run with coverage report
+pytest tests/test_data_loader.py  # Run tests for one module
+```
+
+### Test Data Strategy: In-Memory Fixtures
+
+Tests use **in-memory DataFrames** created in `tests/conftest.py` rather than external CSV files. A small sample DataFrame (3-5 rows) covers the key scenarios:
+- A rated, completed book with a valid ISBN
+- A rated, completed book with no ISBN
+- An unrated to-read book
+- A did-not-finish book
+- Edge cases: empty ISBNs, wrapped ISBN format (`="123"`)
+
+For tests that need files on disk (e.g., testing DataLoader's CSV loading or MetadataFetcher's cache persistence), fixtures write the sample data to a temporary directory that's automatically cleaned up after each test.
+
+For HTTP tests, **requests-mock** intercepts outgoing requests and returns predefined responses — no real API calls are made. This makes tests fast, deterministic, and offline-safe.
+
+### What We Test
+
+#### DataLoader (`tests/test_data_loader.py`)
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_loads_correct_number_of_books` | CSV parsing produces expected row count |
+| `test_clean_isbn_removes_wrapping` | `="0547928246"` → `"0547928246"` |
+| `test_clean_isbn_handles_empty` | Empty/NaN ISBN → `""` |
+| `test_columns_have_correct_types` | `my_rating` is int, `avg_rating` is float |
+| `test_get_rated_books` | Only returns books with `my_rating > 0` |
+| `test_get_to_read_books` | Only returns `shelf == "to-read"` |
+| `test_get_read_books` | Only returns `shelf == "read"` |
+| `test_get_dnf_books` | Only returns `shelf == "did-not-finish"` |
+| `test_get_books_missing_isbn` | Returns books with both `isbn` and `isbn13` empty |
+| `test_summary_contains_key_info` | Summary string includes book count, rated count |
+
+#### MetadataFetcher (`tests/test_metadata_fetcher.py`)
+
+| Test | What it verifies |
+|------|-----------------|
+| `test_extract_description_string` | Handles plain string description |
+| `test_extract_description_dict` | Handles `{"type": ..., "value": ...}` format |
+| `test_extract_description_missing` | No description field → `""` |
+| `test_clean_title_strips_series` | `"Book (Series, #2)"` → `"Book"` |
+| `test_clean_title_strips_subtitle` | `"Book: Long Subtitle"` → `"Book"` |
+| `test_clean_title_no_change` | Simple title stays unchanged |
+| `test_build_cover_url` | Generates correct cover URL from ID |
+| `test_resolve_work_id_by_isbn` | Mocked ISBN endpoint → correct work key |
+| `test_resolve_work_id_by_isbn_not_found` | 404 → `None` |
+| `test_resolve_work_id_by_search` | Mocked search → correct work key |
+| `test_request_handles_rate_limit` | 429 then 200 → retries and succeeds |
+| `test_request_handles_network_error` | Connection error → `None` |
+| `test_cache_saves_and_loads` | Save cache, new instance loads it correctly |
+| `test_fetch_metadata_for_book_full_flow` | Full two-pass flow with mocked endpoints |
+
+### Fixture Architecture
+
+Fixtures are defined in `tests/conftest.py` and automatically injected into test functions by pytest:
+
+```
+sample_goodreads_df        → In-memory DataFrame (3-5 rows)
+    ↓
+temp_csv_file              → Writes DataFrame to temp CSV file
+    ↓
+data_loader                → DataLoader initialized with temp CSV
+
+sample_metadata_cache      → In-memory dict mimicking enriched_books.json
+    ↓
+temp_cache_file            → Writes dict to temp JSON file
+    ↓
+metadata_fetcher           → MetadataFetcher initialized with temp cache
+```
+
+Fixtures use `tempfile.TemporaryDirectory` for file-based tests, ensuring cleanup after each test. The `requests_mock` fixture is provided automatically by the requests-mock library.
+
+---
+
+## Verification — Recommender Quality
 
 ### How to validate the recommender is working well
 
